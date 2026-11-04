@@ -3,9 +3,11 @@ const cors = require('cors');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const twilio = require('twilio');
 
+const nodemailer = require('nodemailer');
+
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.use(cors({ origin: ['https://joinclearapy.com', 'https://www.joinclearapy.com'] }));
+app.use(express.json({ limit: '10kb' }));
 
 const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
@@ -14,7 +16,58 @@ const twilioClient = twilio(
 
 const REAL_PHONE_NUMBER = process.env.REAL_PHONE_NUMBER;
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || '+18633342447';
-const CHARGE_AMOUNT = parseInt(process.env.CHARGE_AMOUNT || '500'); // $5 in cents
+const CHARGE_AMOUNT = parseInt(process.env.CHARGE_AMOUNT || '4000'); // $40 in cents
+const ALERT_PHONE = process.env.ALERT_PHONE; // Alina's cell, set in Railway only
+const GMAIL_USER = process.env.GMAIL_USER;
+const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
+const mailer = (GMAIL_USER && GMAIL_APP_PASSWORD)
+  ? nodemailer.createTransport({ service: 'gmail', auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD } })
+  : null;
+
+// ─── LEAD FORM ───────────────────────────────────────────────────────────────
+const hits = new Map();
+const clean = (s, n) => String(s || '').replace(/[\r\n\t]+/g, ' ').replace(/[<>]/g, '').trim().slice(0, n);
+
+app.post('/lead', async (req, res) => {
+  const ip = req.headers['x-forwarded-for'] || req.ip;
+  const now = Date.now();
+  const recent = (hits.get(ip) || []).filter(t => now - t < 3600000);
+  if (recent.length >= 5) return res.status(429).json({ error: 'Too many requests. Please try again later.' });
+  hits.set(ip, [...recent, now]);
+
+  const b = req.body || {};
+  if (b.website) return res.json({ ok: true }); // honeypot: silently drop bots
+  const name = clean(b.name, 100), company = clean(b.company, 120), email = clean(b.email, 160);
+  if (!name || !company || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Please fill in your name, company and a valid email.' });
+  }
+
+  const results = await Promise.allSettled([
+    ALERT_PHONE
+      ? twilioClient.messages.create({
+          to: ALERT_PHONE,
+          from: TWILIO_PHONE_NUMBER,
+          body: `New Clearapy lead: ${name} from ${company}. ${email}`,
+        })
+      : Promise.reject(new Error('ALERT_PHONE not set')),
+    mailer
+      ? mailer.sendMail({
+          from: `Clearapy <${GMAIL_USER}>`,
+          to: email,
+          replyTo: GMAIL_USER,
+          subject: 'Thanks for reaching out to Clearapy',
+          text: `Hi ${name},\n\nThank you for reaching out about support for ${company}. We received your details and will contact you personally very soon.\n\nWarmly,\nClearapy\n\nClearapy is a peer support listening line, not a licensed mental health service. If you are in crisis, call or text 988.`,
+        })
+      : Promise.reject(new Error('Email not configured')),
+  ]);
+  results.forEach((r, i) => { if (r.status === 'rejected') console.error(i ? 'Auto-reply failed:' : 'SMS failed:', r.reason.message); });
+
+  // Success as long as at least one channel worked, so Alina never loses a lead
+  if (results.every(r => r.status === 'rejected')) {
+    return res.status(500).json({ error: 'Something went wrong. Please email clearapycs@gmail.com.' });
+  }
+  res.json({ ok: true });
+});
 const BASE_URL = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : 'https://clearapy-callgate-production.up.railway.app';
@@ -39,7 +92,7 @@ app.post('/create-checkout', async (req, res) => {
           price_data: {
             currency: 'usd',
             product_data: {
-              name: 'Clearapy Check-In Call — $5/hr',
+              name: 'Clearapy Check-In Call, $40 per call',
               description: 'By completing this purchase you confirm that you have read and agree to Clearapy\'s terms of conduct: all callers must remain respectful. Sexual conversation, solicitation, or requests for operator personal information are strictly prohibited and will result in immediate call termination with no refund.',
             },
             unit_amount: CHARGE_AMOUNT,
@@ -240,7 +293,7 @@ app.get('/call-ready', async (req, res) => {
 // It forwards the call to your real number
 app.post('/voice', (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
-twiml.dial({ callerId: TWILIO_PHONE_NUMBER }, REAL_PHONE_NUMBER);
+  twiml.dial({ callerId: TWILIO_PHONE_NUMBER }, REAL_PHONE_NUMBER);
   res.type('text/xml');
   res.send(twiml.toString());
 });
