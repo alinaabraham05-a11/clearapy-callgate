@@ -3,8 +3,6 @@ const cors = require('cors');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const twilio = require('twilio');
 
-const nodemailer = require('nodemailer');
-
 const app = express();
 app.use(cors({ origin: ['https://joinclearapy.com', 'https://www.joinclearapy.com'] }));
 app.use(express.json({ limit: '10kb' }));
@@ -18,11 +16,21 @@ const REAL_PHONE_NUMBER = process.env.REAL_PHONE_NUMBER;
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || '+18633342447';
 const CHARGE_AMOUNT = parseInt(process.env.CHARGE_AMOUNT || '4000'); // $40 in cents
 const ALERT_PHONE = process.env.ALERT_PHONE; // Alina's cell, set in Railway only
-const GMAIL_USER = process.env.GMAIL_USER;
-const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
-const mailer = (GMAIL_USER && GMAIL_APP_PASSWORD)
-  ? nodemailer.createTransport({ service: 'gmail', auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD } })
-  : null;
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const MAIL_FROM = process.env.MAIL_FROM || 'Clearapy <hello@joinclearapy.com>';
+const ALERT_EMAIL = process.env.ALERT_EMAIL || 'clearapycs@gmail.com';
+
+// Sends email over HTTPS (Railway blocks SMTP)
+async function sendEmail({ to, subject, text, replyTo }) {
+  if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY not set');
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: MAIL_FROM, to: [to], subject, text, reply_to: replyTo }),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!r.ok) throw new Error(`Email API ${r.status}: ${await r.text()}`);
+}
 
 // ─── LEAD FORM ───────────────────────────────────────────────────────────────
 const hits = new Map();
@@ -50,20 +58,24 @@ app.post('/lead', async (req, res) => {
           body: `New Clearapy lead: ${name} from ${company}. ${email}`,
         })
       : Promise.reject(new Error('ALERT_PHONE not set')),
-    mailer
-      ? mailer.sendMail({
-          from: `Clearapy <${GMAIL_USER}>`,
-          to: email,
-          replyTo: GMAIL_USER,
-          subject: 'Thanks for reaching out to Clearapy',
-          text: `Hi ${name},\n\nThank you for reaching out about support for ${company}. We received your details and will contact you personally very soon.\n\nWarmly,\nClearapy\n\nClearapy is a peer support listening line, not a licensed mental health service. If you are in crisis, call or text 988.`,
-        })
-      : Promise.reject(new Error('Email not configured')),
+    sendEmail({
+      to: email,
+      replyTo: ALERT_EMAIL,
+      subject: 'Thanks for reaching out to Clearapy',
+      text: `Hi ${name},\n\nThank you for reaching out about support for ${company}. We received your details and will contact you personally very soon.\n\nWarmly,\nClearapy\n\nClearapy is a peer support listening line, not a licensed mental health service. If you are in crisis, call or text 988.`,
+    }),
+    sendEmail({
+      to: ALERT_EMAIL,
+      replyTo: email,
+      subject: `New Clearapy lead: ${name} (${company})`,
+      text: `Name: ${name}\nCompany: ${company}\nEmail: ${email}\n\nReply to this email to respond to them directly.`,
+    }),
   ]);
-  results.forEach((r, i) => { if (r.status === 'rejected') console.error(i ? 'Auto-reply failed:' : 'SMS failed:', r.reason.message); });
+  const labels = ['SMS failed:', 'Auto-reply failed:', 'Lead alert email failed:'];
+  results.forEach((r, i) => { if (r.status === 'rejected') console.error(labels[i], r.reason.message); });
 
-  // Success as long as at least one channel worked, so Alina never loses a lead
-  if (results.every(r => r.status === 'rejected')) {
+  // Texts can be accepted by Twilio but blocked by carriers, so the alert email is the reliable record of a lead
+  if (results[2].status === 'rejected') {
     return res.status(500).json({ error: 'Something went wrong. Please email clearapycs@gmail.com.' });
   }
   res.json({ ok: true });
