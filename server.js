@@ -14,7 +14,7 @@ const twilioClient = twilio(
 
 const REAL_PHONE_NUMBER = process.env.REAL_PHONE_NUMBER;
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || '+18633342447';
-const CHARGE_AMOUNT = parseInt(process.env.CHARGE_AMOUNT || '4000'); // $40 in cents
+const CHARGE_AMOUNT = parseInt(process.env.CHARGE_AMOUNT || '3000'); // $30 in cents
 const ALERT_PHONE = process.env.ALERT_PHONE; // Alina's cell, set in Railway only
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const MAIL_FROM = process.env.MAIL_FROM || 'Clearapy <hello@joinclearapy.com>';
@@ -46,6 +46,7 @@ app.post('/lead', async (req, res) => {
   const b = req.body || {};
   if (b.website) return res.json({ ok: true }); // honeypot: silently drop bots
   const name = clean(b.name, 100), company = clean(b.company, 120), email = clean(b.email, 160);
+  const phone = clean(b.phone, 20).replace(/[^\d+()\-\s.]/g, '');
   if (!name || !company || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return res.status(400).json({ error: 'Please fill in your name, company and a valid email.' });
   }
@@ -55,7 +56,7 @@ app.post('/lead', async (req, res) => {
       ? twilioClient.messages.create({
           to: ALERT_PHONE,
           from: TWILIO_PHONE_NUMBER,
-          body: `New Clearapy lead: ${name} from ${company}. ${email}`,
+          body: `New Clearapy lead: ${name} from ${company}. ${email}${phone ? ' ' + phone : ''}`,
         })
       : Promise.reject(new Error('ALERT_PHONE not set')),
     sendEmail({
@@ -68,7 +69,7 @@ app.post('/lead', async (req, res) => {
       to: ALERT_EMAIL,
       replyTo: email,
       subject: `New Clearapy lead: ${name} (${company})`,
-      text: `Name: ${name}\nCompany: ${company}\nEmail: ${email}\n\nReply to this email to respond to them directly.`,
+      text: `Name: ${name}\nCompany: ${company}\nEmail: ${email}\nPhone: ${phone || 'not provided'}\n\nReply to this email to respond to them directly.`,
     }),
   ]);
   const labels = ['SMS failed:', 'Auto-reply failed:', 'Lead alert email failed:'];
@@ -104,7 +105,7 @@ app.post('/create-checkout', async (req, res) => {
           price_data: {
             currency: 'usd',
             product_data: {
-              name: 'Clearapy Check-In Call, $40 per call',
+              name: 'Clearapy Check-In Call, $30 per call',
               description: 'By completing this purchase you confirm that you have read and agree to Clearapy\'s terms of conduct: all callers must remain respectful. Sexual conversation, solicitation, or requests for operator personal information are strictly prohibited and will result in immediate call termination with no refund.',
             },
             unit_amount: CHARGE_AMOUNT,
